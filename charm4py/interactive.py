@@ -17,25 +17,42 @@ def future_():
     return f
 
 
-class InteractiveConsole(Chare, InteractiveInterpreter):
+class InteractiveConsoleBase:
 
-    def __init__(self, args):
+    def __init__(self):
         global Charm4PyError
         from .charm import Charm4PyError
         # restore original tty stdin and stdout (else readline won't work correctly)
         os.dup2(charm.origStdinFd, 0)
         os.dup2(charm.origStoutFd, 1)
+        os.dup2(charm.origSterrFd, 2)
         charm.dynamic_register['future'] = future_
         charm.dynamic_register['self'] = self
+        self.regexpChareDefine = re.compile(r'class\s*(\S+)\s*\(.*Chare.*\)\s*:')
+        self.options = charm.options.interactive
+
+    def null(self):
+        return
+
+    def write(self, data, sched=True):
+        sys.stdout.write(data)
+        sys.stdout.flush()
+        if sched:
+            # go through charm scheduler to keep things moving
+            self.thisProxy.null(awaitable=True).get()
+
+
+class InteractiveConsole(Chare, InteractiveConsoleBase, InteractiveInterpreter):
+
+    def __init__(self, args):
+        InteractiveConsoleBase.__init__(self)
         InteractiveInterpreter.__init__(self, locals=charm.dynamic_register)
         self.filename = '<console>'
         self.resetbuffer()
         # regexp to detect when user defines a new chare type
-        self.regexpChareDefine = re.compile('class\s*(\S+)\s*\(.*Chare.*\)\s*:')
         # regexps to detect import statements
         self.regexpImport1 = re.compile('\s*from\s*(\S+) import')
         self.regexpImport2 = re.compile('import\s*(\S+)')
-        self.options = charm.options.interactive
 
         try:
             import readline
@@ -56,16 +73,6 @@ class InteractiveConsole(Chare, InteractiveInterpreter):
 
     def resetbuffer(self):
         self.buffer = []
-
-    def null(self):
-        return
-
-    def write(self, data, sched=True):
-        sys.stdout.write(data)
-        sys.stdout.flush()
-        if sched:
-            # go through charm scheduler to keep things moving
-            self.thisProxy.null(awaitable=True).get()
 
     @coro
     def start(self):
@@ -205,6 +212,90 @@ class InteractiveConsole(Chare, InteractiveInterpreter):
             self.write(error_type.__name__ + ': ' + str(error) + ' (PE ' + str(origin) + ')\n')
         else:
             super(InteractiveConsole, self).showtraceback()
+
+
+class InteractiveIpythonConsole(Chare, InteractiveConsoleBase):
+
+    def __init__(self, args):
+        InteractiveConsoleBase.__init__(self)
+        os.dup2(charm.origStdinFd, 0)
+        os.dup2(charm.origStoutFd, 1)
+        os.dup2(charm.origSterrFd, 2)
+        import IPython
+        IPython.start_ipython(user_ns=charm.dynamic_register, argv=['-c', 'pass'])
+        ip = IPython.get_ipython()
+        ip.events.register('post_run_cell', self.post_run_cell)
+        ip.input_transformers_post.append(self.input_transform)
+        self.input_transform_performed = False
+        self.prev_modules = set(sys.modules.keys())
+        self.thisProxy.start()
+
+    def post_run_cell(self, result):
+        new_modules = set(sys.modules.keys()) - self.prev_modules
+        self.prev_modules = set(sys.modules.keys())
+
+        chare_types = []
+        if self.options.verbose > 0 and new_modules:
+            self.write(f'Charm4py> Broadcasting import statement for modules {", ".join(new_modules)}\n')
+
+        for module_name in new_modules:
+            if module_name.startswith('_'):
+                continue
+            if self.options.broadcast_imports:
+                charm.thisProxy.rexec('import ' + module_name, awaitable=True).get()
+            try:
+                members = inspect.getmembers(sys.modules[module_name], inspect.isclass)
+            except:
+                # some modules can throw exceptions with inspect.getmembers, ignoring them for now
+                continue
+            for C_name, C in members:
+                if C.__module__ != chare.__name__ and hasattr(C, 'mro'):
+                    try:
+                        mro = C.mro()
+                    except TypeError:
+                        continue
+                    if chare.ArrayMap in mro:
+                        chare_types.append(C)
+                    elif Chare in mro:
+                        chare_types.append(C)
+                    elif chare.Group in mro or chare.Array in mro or chare.Mainchare in mro:
+                        raise Charm4PyError('Chares must not inherit from Group, Array or'
+                                            ' Mainchare. Refer to new API')
+        if len(chare_types) > 0:
+            if self.options.broadcast_imports:
+                charm.thisProxy.registerNewChareTypes(chare_types, awaitable=True).get()
+                if self.options.verbose > 0:
+                    self.write('Broadcasted the following chare definitions: ' + str([str(C) for C in chare_types]) + '\n')
+            else:
+                self.write('Charm4py> ERROR: import module(s) contain Chare definitions but the import was not broadcasted\n')
+
+        # somehow we seem to need to run this twice to propagte execptions
+        self.thisProxy.null(awaitable=True).get()
+        self.thisProxy.null(awaitable=True).get()
+        self.input_transform_performed = False
+
+    def input_transform(self, lines):
+        # warning, this is run twice
+        if self.input_transform_performed:
+            return ['\n']
+        for line in lines:
+            m = self.regexpChareDefine.search(line)
+            if m is not None:
+                newChareTypeName = m.group(1)
+                source = '\n'.join(lines)
+                charm.thisProxy.registerNewChareType(newChareTypeName, source, awaitable=True).get()
+                if self.options.verbose > 0:
+                    self.write('Charm4py> Broadcasted Chare definition\n')
+                self.input_transform_performed = True
+                return ['\n']
+        return lines
+
+    @coro
+    def start(self):
+        import IPython
+        ip = IPython.get_ipython()
+        ip.interact()
+        charm.exit()
 
 
 if __name__ == '__main__':

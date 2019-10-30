@@ -574,11 +574,12 @@ class Charm(object):
         self.options.check_deprecated()
 
         if interactive:
-            from .interactive import InteractiveConsole as entry
+            from .interactive import InteractiveIpythonConsole as entry
             from .channel import Channel
             self.options.remote_exec = True
             self.origStdinFd = os.dup(0)
             self.origStoutFd = os.dup(1)
+            self.origSterrFd = os.dup(2)
             self.interactive = True
             self.dynamic_register.update({'charm': charm, 'Chare': Chare, 'Group': Group,
                                           'Array': Array, 'Reducer': self.reducers,
